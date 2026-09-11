@@ -15,8 +15,8 @@ $lf = [string][char]10
 $cr = [string][char]13
 
 $expectedVersion = '3.203'
-$expectedSourceSha256 = '9331ab30cd412d36e3f023acedbcdc9313d907eebd28138eae383fed2f312c5a'
-$expectedMainSpecSha256 = '453913FB393794BDBF9C8D786A894BA1A6DE7CC032DEC1C6E8675F2A821EC055'
+$expectedSourceSha256 = 'd75524da9a637b6de7b6f4a791a53b285c76034d8323d1bbd53ec21251f8debc'
+$expectedMainSpecSha256 = '0064174F1D3944B825F3D63316548B2AE8435C0D1BB060CA66F2F8497126BC0B'
 $expectedSpeechSpecSha256 = '744D80FA70E81F9CE6B05BA5A343BFBF00C9EF89B4EAC5DDA8A86867B479F3F6'
 $expectedAssetName = "RabbitSubtitle-$expectedVersion-Windows-x64.zip"
 $expectedPackageRoot = "RabbitSubtitle-$expectedVersion"
