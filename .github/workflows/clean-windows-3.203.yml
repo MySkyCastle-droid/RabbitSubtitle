@@ -1,0 +1,334 @@
+# Draft-asset acceptance only. This workflow deliberately contains no release,
+# upload, publish, Pages, deployment, or repository-write step.
+name: Clean Windows acceptance 3.203
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact release version (must be 3.203)
+        required: true
+        type: string
+        default: "3.203"
+      sourceSha256:
+        description: Frozen source SHA-256
+        required: true
+        type: string
+        default: "9331ab30cd412d36e3f023acedbcdc9313d907eebd28138eae383fed2f312c5a"
+      artifactSha256:
+        description: Expected SHA-256 of RabbitSubtitle-3.203-Windows-x64.zip
+        required: true
+        type: string
+      artifactBytes:
+        description: Expected byte length
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-windows-3.203-main
+  cancel-in-progress: false
+
+jobs:
+  clean-windows:
+    name: Draft ZIP on clean Windows
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      REQUESTED_VERSION: ${{ inputs.version }}
+      REQUESTED_SOURCE_SHA256: ${{ inputs.sourceSha256 }}
+      REQUESTED_ARTIFACT_SHA256: ${{ inputs.artifactSha256 }}
+      REQUESTED_ARTIFACT_BYTES: ${{ inputs.artifactBytes }}
+
+    steps:
+      - name: Reject every ref except refs/heads/main
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REPOSITORY -cne 'MySkyCastle-droid/RabbitSubtitle') {
+            throw "This workflow only accepts the canonical release repository; received $($env:GITHUB_REPOSITORY)."
+          }
+          if ($env:GITHUB_REF -cne 'refs/heads/main') {
+            throw "This acceptance workflow is restricted to refs/heads/main; received $($env:GITHUB_REF)."
+          }
+
+      # actions/checkout v4.4.0, pinned to the reviewed commit.
+      - name: Check out the trusted main workflow helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Initialize artifact-bound evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence'
+          $records = Join-Path $evidence 'records'
+          if (Test-Path -LiteralPath $evidence) {
+            throw 'Evidence directory unexpectedly exists; refusing to reuse it.'
+          }
+          New-Item -ItemType Directory -Path $records | Out-Null
+          $dispatch = [ordered]@{
+            version = $env:REQUESTED_VERSION
+            sourceSha256 = $env:REQUESTED_SOURCE_SHA256
+            artifactSha256 = $env:REQUESTED_ARTIFACT_SHA256
+            artifactBytes = $env:REQUESTED_ARTIFACT_BYTES
+            repository = $env:GITHUB_REPOSITORY
+            ref = $env:GITHUB_REF
+            sha = $env:GITHUB_SHA
+            runId = $env:GITHUB_RUN_ID
+            runAttempt = $env:GITHUB_RUN_ATTEMPT
+          }
+          $text = ($dispatch | ConvertTo-Json -Depth 5) + [char]10
+          [IO.File]::WriteAllText((Join-Path $records 'dispatch-inputs.json'), $text, [Text.UTF8Encoding]::new($false))
+
+      - name: Resolve exact draft metadata and download exact asset
+        id: candidate-download
+        shell: pwsh
+        env:
+          # Token scope is limited to this metadata/download step.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          function Invoke-GhJson {
+            param([string[]]$Arguments, [string]$Label)
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              $output = & gh @Arguments
+              $exitCode = $LASTEXITCODE
+              $text = @($output) -join [char]10
+              if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($text)) { return $text }
+              if ($attempt -lt 3) { Start-Sleep -Seconds (2 * $attempt) }
+            }
+            throw "$Label failed after three attempts."
+          }
+          $version = $env:REQUESTED_VERSION
+          $sourceSha = $env:REQUESTED_SOURCE_SHA256.ToLowerInvariant()
+          $artifactSha = $env:REQUESTED_ARTIFACT_SHA256.ToLowerInvariant()
+          $artifactBytesText = $env:REQUESTED_ARTIFACT_BYTES
+          $trustedSourceSha = '9331ab30cd412d36e3f023acedbcdc9313d907eebd28138eae383fed2f312c5a'
+          if ($version -cne '3.203') { throw 'Only version 3.203 is accepted.' }
+          if ($sourceSha -cne $trustedSourceSha) { throw 'sourceSha256 does not identify the frozen 3.203 source.' }
+          if ($artifactSha -cnotmatch '^[0-9a-f]{64}$') { throw 'artifactSha256 must contain 64 hexadecimal characters.' }
+          if ($artifactBytesText -cnotmatch '^[1-9][0-9]*$') { throw 'artifactBytes must be a positive base-10 integer.' }
+          $artifactBytes = 0L
+          $parsed = [int64]::TryParse($artifactBytesText, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$artifactBytes)
+          if (-not $parsed) { throw 'artifactBytes does not fit in a signed 64-bit integer.' }
+
+          $tag = "v$version"
+          $releaseName = "RabbitSubtitle $version"
+          $assetName = "RabbitSubtitle-$version-Windows-x64.zip"
+          $viewArguments = @('release', 'view', $tag, '--repo', $env:GITHUB_REPOSITORY, '--json', 'databaseId,tagName,name,isDraft,isPrerelease,targetCommitish')
+          $viewJson = Invoke-GhJson -Arguments $viewArguments -Label "Resolve exact draft tag $tag"
+          $view = $viewJson | ConvertFrom-Json -Depth 10
+          $viewExact = [int64]$view.databaseId -gt 0 -and [string]$view.tagName -ceq $tag -and [string]$view.name -ceq $releaseName -and [bool]$view.isDraft -and -not [bool]$view.isPrerelease -and [string]$view.targetCommitish -ceq 'main'
+          if (-not $viewExact) { throw 'Release view metadata is not the exact main-targeted 3.203 draft.' }
+
+          $apiArguments = @('api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$($env:GITHUB_REPOSITORY)/releases/$($view.databaseId)")
+          $releaseJson = Invoke-GhJson -Arguments $apiArguments -Label 'Read draft release metadata by numeric release id'
+          $release = $releaseJson | ConvertFrom-Json -Depth 20
+          $releaseExact = [int64]$release.id -eq [int64]$view.databaseId -and [string]$release.tag_name -ceq $tag -and [string]$release.name -ceq $releaseName -and [bool]$release.draft -and -not [bool]$release.prerelease -and [string]$release.target_commitish -ceq 'main'
+          if (-not $releaseExact) { throw 'Numeric release metadata does not match the exact main-targeted draft.' }
+          $assets = @($release.assets | Where-Object { [string]$_.name -ceq $assetName })
+          if ($assets.Count -ne 1) { throw 'The draft must contain exactly one asset with the canonical ZIP name.' }
+          $asset = $assets[0]
+          $expectedDigest = "sha256:$artifactSha"
+          $acceptedContentTypes = @('application/zip', 'application/x-zip-compressed', 'application/octet-stream')
+          $assetExact = [int64]$asset.id -gt 0 -and [string]$asset.state -ceq 'uploaded' -and [int64]$asset.size -eq $artifactBytes -and [string]$asset.digest -ceq $expectedDigest -and $acceptedContentTypes -ccontains [string]$asset.content_type
+          if (-not $assetExact) { throw 'Draft asset state, size, digest, or content type does not match the requested artifact.' }
+
+          $archive = Join-Path $env:RUNNER_TEMP $assetName
+          if (Test-Path -LiteralPath $archive) { throw 'Candidate archive path unexpectedly exists.' }
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            if (Test-Path -LiteralPath $archive) { [IO.File]::Delete($archive) }
+            & gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $assetName --output $archive
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $archive -PathType Leaf)) {
+              $downloaded = $true
+              break
+            }
+            if ($attempt -lt 3) { Start-Sleep -Seconds (4 * $attempt) }
+          }
+          if (-not $downloaded) { throw 'Draft asset download failed after three attempts.' }
+          $download = Get-Item -LiteralPath $archive
+          $downloadSha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ([int64]$download.Length -ne $artifactBytes) { throw 'Downloaded ZIP byte length changed.' }
+          if ($downloadSha -cne $artifactSha) { throw 'Downloaded ZIP SHA-256 changed.' }
+
+          $postJson = Invoke-GhJson -Arguments $apiArguments -Label 'Re-read draft metadata after download'
+          $post = $postJson | ConvertFrom-Json -Depth 20
+          $postAssets = @($post.assets | Where-Object { [string]$_.name -ceq $assetName })
+          if ($postAssets.Count -ne 1) { throw 'Draft asset identity changed during download.' }
+          $postAsset = $postAssets[0]
+          $postReleaseExact = [bool]$post.draft -and -not [bool]$post.prerelease -and [int64]$post.id -eq [int64]$release.id -and [string]$post.tag_name -ceq $tag -and [string]$post.name -ceq $releaseName -and [string]$post.target_commitish -ceq 'main'
+          $postAssetExact = [int64]$postAsset.id -eq [int64]$asset.id -and [string]$postAsset.name -ceq $assetName -and [string]$postAsset.created_at -ceq [string]$asset.created_at -and [string]$postAsset.updated_at -ceq [string]$asset.updated_at -and [int64]$postAsset.size -eq $artifactBytes -and [string]$postAsset.digest -ceq $expectedDigest -and [string]$postAsset.state -ceq 'uploaded' -and [string]$postAsset.content_type -ceq [string]$asset.content_type
+          $postExact = $postReleaseExact -and $postAssetExact
+          if (-not $postExact) { throw 'Draft or asset metadata changed during the acceptance download.' }
+
+          $ghVersion = (gh --version | Select-Object -First 1)
+          $metadata = [ordered]@{
+            version = $version
+            sourceSha256 = $sourceSha
+            artifactSha256 = $artifactSha
+            artifactBytes = $artifactBytes
+            assetName = $assetName
+            assetId = [int64]$asset.id
+            assetContentType = [string]$asset.content_type
+            assetState = [string]$asset.state
+            assetDigest = [string]$asset.digest
+            assetCreatedAt = [string]$asset.created_at
+            assetUpdatedAt = [string]$asset.updated_at
+            releaseId = [int64]$release.id
+            releaseTag = [string]$release.tag_name
+            releaseName = [string]$release.name
+            releaseDraft = [bool]$release.draft
+            releasePrerelease = [bool]$release.prerelease
+            releaseTargetCommitish = [string]$release.target_commitish
+            repository = $env:GITHUB_REPOSITORY
+            downloadedAt = [DateTimeOffset]::UtcNow.ToString('o')
+            ghVersion = [string]$ghVersion
+          }
+          $metadataText = ($metadata | ConvertTo-Json -Depth 10) + [char]10
+          $metadataPath = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence\records\download-metadata.json'
+          [IO.File]::WriteAllText($metadataPath, $metadataText, [Text.UTF8Encoding]::new($false))
+
+      - name: Run package acceptance without repository token
+        id: package-acceptance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN) -or -not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+            throw 'Repository token leaked beyond the download step.'
+          }
+          $archive = Join-Path $env:RUNNER_TEMP "RabbitSubtitle-$($env:REQUESTED_VERSION)-Windows-x64.zip"
+          $evidence = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence'
+          & '.github/scripts/clean-windows-3.203.ps1' -Version $env:REQUESTED_VERSION -SourceSha256 $env:REQUESTED_SOURCE_SHA256 -ArtifactSha256 $env:REQUESTED_ARTIFACT_SHA256 -ArtifactBytes $env:REQUESTED_ARTIFACT_BYTES -ArchivePath $archive -EvidenceDirectory $evidence
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Guarantee a fail-closed report for preflight failures
+        if: always()
+        shell: pwsh
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.candidate-download.outcome }}
+          ACCEPTANCE_OUTCOME: ${{ steps.package-acceptance.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence'
+          $records = Join-Path $evidence 'records'
+          New-Item -ItemType Directory -Path $records -Force | Out-Null
+          $outcomes = [ordered]@{
+            download = $env:DOWNLOAD_OUTCOME
+            packageAcceptance = $env:ACCEPTANCE_OUTCOME
+            recordedAt = [DateTimeOffset]::UtcNow.ToString('o')
+          }
+          $outcomeText = ($outcomes | ConvertTo-Json -Depth 5) + [char]10
+          [IO.File]::WriteAllText((Join-Path $records 'workflow-outcomes.json'), $outcomeText, [Text.UTF8Encoding]::new($false))
+          $reportPath = Join-Path $evidence 'clean-windows-report.json'
+          if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+            $artifactBytes = 0L
+            [void][int64]::TryParse($env:REQUESTED_ARTIFACT_BYTES, [ref]$artifactBytes)
+            $fallback = [ordered]@{
+              schemaVersion = 1
+              gate = 'cleanWindowsPackage'
+              version = $env:REQUESTED_VERSION
+              sourceSha256 = $env:REQUESTED_SOURCE_SHA256.ToLowerInvariant()
+              artifactSha256 = $env:REQUESTED_ARTIFACT_SHA256.ToLowerInvariant()
+              artifactBytes = $artifactBytes
+              artifactName = "RabbitSubtitle-$($env:REQUESTED_VERSION)-Windows-x64.zip"
+              overallStatus = 'FAIL'
+              passed = $false
+              releaseGateEligible = $false
+              coreAcceptancePassed = $false
+              acceptanceScope = [ordered]@{
+                gate = 'cleanWindowsPackage'
+                passed = $false
+                requiredChecks = @(
+                  'zipSafetyAndExtraction'
+                  'packageIdentityAndManifest'
+                  'pythonFreePathAndNoDevelopmentDirectoryDependency'
+                  'webUiStartup'
+                  'bilingualReleaseSmoke'
+                  'alignmentEmptyCacheThenPublicInstallThenOfflineRun'
+                  'speakerEmptyCacheControlledCredentialMissingAndModelsMissing'
+                )
+                exclusions = @(
+                  [ordered]@{
+                    capability = 'speakerFullInstallAndOfflineDiarization'
+                    status = 'notRunTermsCredentialRequired'
+                    delegatedGate = 'automaticDiarization'
+                    reason = 'Requires tester-owned Hugging Face credentials and acceptance of upstream gated-model terms; cleanWindowsPackage does not claim this capability passed.'
+                  }
+                )
+              }
+              startedAt = [DateTimeOffset]::UtcNow.ToString('o')
+              finishedAt = [DateTimeOffset]::UtcNow.ToString('o')
+              github = [ordered]@{
+                repository = $env:GITHUB_REPOSITORY
+                ref = $env:GITHUB_REF
+                sha = $env:GITHUB_SHA
+                runId = $env:GITHUB_RUN_ID
+                runAttempt = $env:GITHUB_RUN_ATTEMPT
+                workflow = $env:GITHUB_WORKFLOW
+              }
+              checks = [ordered]@{}
+              fatalError = [ordered]@{
+                phase = 'workflow-preflight'
+                type = 'PriorStepFailure'
+                message = 'The draft download or package acceptance step failed before a complete report was written. Inspect the job log and workflow-outcomes.json.'
+              }
+              records = @('workflow-outcomes.json')
+              limitations = @(
+                'No acceptance result is claimed. The release gate remains closed.'
+                'windows-latest and its preinstalled GitHub CLI are mutable runner dependencies; successful runs record their resolved versions.'
+              )
+            }
+            $fallbackText = ($fallback | ConvertTo-Json -Depth 20) + [char]10
+            [IO.File]::WriteAllText($reportPath, $fallbackText, [Text.UTF8Encoding]::new($false))
+          }
+
+      # actions/upload-artifact v4.6.2, pinned to the reviewed commit.
+      - name: Upload immutable clean-Windows evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: clean-windows-3.203-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/clean-windows-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce fail-closed release gate
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reportPath = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence\clean-windows-report.json'
+          if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+            throw 'Artifact-bound clean-windows-report.json was not produced; release gate is closed.'
+          }
+          $report = Get-Content -LiteralPath $reportPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 30
+          $artifactSha = $env:REQUESTED_ARTIFACT_SHA256.ToLowerInvariant()
+          $artifactBytes = [int64]$env:REQUESTED_ARTIFACT_BYTES
+          $identityExact = [string]$report.version -ceq $env:REQUESTED_VERSION -and [string]$report.sourceSha256 -ceq $env:REQUESTED_SOURCE_SHA256.ToLowerInvariant() -and [string]$report.artifactSha256 -ceq $artifactSha -and [int64]$report.artifactBytes -eq $artifactBytes
+          if (-not $identityExact) { throw 'Clean Windows report is not bound to the requested artifact.' }
+          $speakerProperty = $report.checks.PSObject.Properties['speaker']
+          $speakerStatus = if ($null -eq $speakerProperty) { 'NOT REACHED' } else { [string]$speakerProperty.Value.status }
+          $summary = @(
+            "### RabbitSubtitle $($report.version) clean Windows gate"
+            ""
+            "- Artifact SHA-256: $($report.artifactSha256)"
+            "- Artifact bytes: $($report.artifactBytes)"
+            "- Overall status: $($report.overallStatus)"
+            "- Core acceptance: $($report.coreAcceptancePassed)"
+            "- Speaker full install / offline diarization: $speakerStatus"
+          ) -join [char]10
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $summary + [char]10, [Text.UTF8Encoding]::new($false))
+          $scopeProperty = $report.PSObject.Properties['acceptanceScope']
+          $scopeExact = $null -ne $scopeProperty -and [string]$scopeProperty.Value.gate -ceq 'cleanWindowsPackage' -and [bool]$scopeProperty.Value.passed
+          $speakerExact = $null -ne $speakerProperty -and [string]$speakerProperty.Value.status -ceq 'notRunTermsCredentialRequired' -and [string]$speakerProperty.Value.fullInstall -ceq 'notRunTermsCredentialRequired' -and [string]$speakerProperty.Value.offlineDiarization -ceq 'notRunTermsCredentialRequired' -and [string]$speakerProperty.Value.delegatedGate -ceq 'automaticDiarization' -and [string]$speakerProperty.Value.controlledPreconditions.status -ceq 'passed'
+          $gatePassed = [string]$report.gate -ceq 'cleanWindowsPackage' -and [bool]$report.passed -and [bool]$report.releaseGateEligible -and [bool]$report.coreAcceptancePassed -and [string]$report.overallStatus -ceq 'PASS' -and $scopeExact -and $speakerExact
+          if (-not $gatePassed) {
+            throw "Clean Windows report rejected (overall=$($report.overallStatus), scopeExact=$scopeExact, speakerSemanticsExact=$speakerExact); no deployment or release promotion is permitted."
+          }
