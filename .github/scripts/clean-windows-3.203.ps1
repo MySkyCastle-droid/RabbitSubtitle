@@ -15,16 +15,16 @@ $lf = [string][char]10
 $cr = [string][char]13
 
 $expectedVersion = '3.203'
-$expectedSourceSha256 = '8ffc581ad8a6dc1e345263f896187d6757ef8fcc2bcf3d51cd3dc31466086dc5'
+$expectedSourceSha256 = '1681a475c8be73348b852fd6248315c6cfb9795b57ef76f1846a8c4cd69c542f'
 $expectedMainSpecSha256 = '0064174F1D3944B825F3D63316548B2AE8435C0D1BB060CA66F2F8497126BC0B'
-$expectedSpeechSpecSha256 = '744D80FA70E81F9CE6B05BA5A343BFBF00C9EF89B4EAC5DDA8A86867B479F3F6'
+$expectedSpeechSpecSha256 = '40B0F97EEC4B0417304FAD334822758DD28BA13C3D0CD5BD50B13499429D8403'
 $expectedAssetName = "RabbitSubtitle-$expectedVersion-Windows-x64.zip"
 $expectedPackageRoot = "RabbitSubtitle-$expectedVersion"
 $startedAt = [DateTimeOffset]::UtcNow
 
 $EvidenceDirectory = [IO.Path]::GetFullPath($EvidenceDirectory)
 $ArchivePath = [IO.Path]::GetFullPath($ArchivePath)
-$recordsDirectory = Join-Path $EvidenceDirectory 'records'
+$recordsDirectory = Join-Path $EvidenceDirectory 'githubWindowsRunner.records'
 $outputsDirectory = Join-Path $EvidenceDirectory 'outputs'
 New-Item -ItemType Directory -Path $EvidenceDirectory, $recordsDirectory, $outputsDirectory -Force | Out-Null
 
@@ -884,7 +884,7 @@ $report = [ordered]@{
         'windows-latest and its preinstalled GitHub CLI are mutable runner dependencies. The report records the image identity and download metadata records the GitHub CLI version.'
     )
 }
-$reportPath = Join-Path $EvidenceDirectory 'clean-windows-report.json'
+$reportPath = Join-Path $EvidenceDirectory 'github-windows-runner.json'
 Write-Json -Path $reportPath -Value $report
 
 if ($null -ne $fatalError) {

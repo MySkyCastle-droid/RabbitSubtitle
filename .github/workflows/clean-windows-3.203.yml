@@ -14,7 +14,7 @@ on:
         description: Frozen source SHA-256
         required: true
         type: string
-        default: "8ffc581ad8a6dc1e345263f896187d6757ef8fcc2bcf3d51cd3dc31466086dc5"
+        default: "1681a475c8be73348b852fd6248315c6cfb9795b57ef76f1846a8c4cd69c542f"
       artifactSha256:
         description: Expected SHA-256 of RabbitSubtitle-3.203-Windows-x64.zip
         required: true
@@ -66,7 +66,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $evidence = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence'
-          $records = Join-Path $evidence 'records'
+          $records = Join-Path $evidence 'githubWindowsRunner.records'
           if (Test-Path -LiteralPath $evidence) {
             throw 'Evidence directory unexpectedly exists; refusing to reuse it.'
           }
@@ -109,7 +109,7 @@ jobs:
           $sourceSha = $env:REQUESTED_SOURCE_SHA256.ToLowerInvariant()
           $artifactSha = $env:REQUESTED_ARTIFACT_SHA256.ToLowerInvariant()
           $artifactBytesText = $env:REQUESTED_ARTIFACT_BYTES
-          $trustedSourceSha = '8ffc581ad8a6dc1e345263f896187d6757ef8fcc2bcf3d51cd3dc31466086dc5'
+          $trustedSourceSha = '1681a475c8be73348b852fd6248315c6cfb9795b57ef76f1846a8c4cd69c542f'
           if ($version -cne '3.203') { throw 'Only version 3.203 is accepted.' }
           if ($sourceSha -cne $trustedSourceSha) { throw 'sourceSha256 does not identify the frozen 3.203 source.' }
           if ($artifactSha -cnotmatch '^[0-9a-f]{64}$') { throw 'artifactSha256 must contain 64 hexadecimal characters.' }
@@ -121,6 +121,11 @@ jobs:
           $tag = "v$version"
           $releaseName = "RabbitSubtitle $version"
           $assetName = "RabbitSubtitle-$version-Windows-x64.zip"
+          $sidecarName = "$assetName.sha256"
+          $expectedSidecarBytes = [Text.Encoding]::UTF8.GetBytes("$($artifactSha.ToUpperInvariant())  $assetName`r`n")
+          $sidecarHashAlgorithm = [Security.Cryptography.SHA256]::Create()
+          try { $expectedSidecarSha = ([BitConverter]::ToString($sidecarHashAlgorithm.ComputeHash($expectedSidecarBytes))).Replace('-', '').ToLowerInvariant() }
+          finally { $sidecarHashAlgorithm.Dispose() }
           $viewArguments = @('release', 'view', $tag, '--repo', $env:GITHUB_REPOSITORY, '--json', 'databaseId,tagName,name,isDraft,isPrerelease,targetCommitish')
           $viewJson = Invoke-GhJson -Arguments $viewArguments -Label "Resolve exact draft tag $tag"
           $view = $viewJson | ConvertFrom-Json -Depth 10
@@ -132,6 +137,8 @@ jobs:
           $release = $releaseJson | ConvertFrom-Json -Depth 20
           $releaseExact = [int64]$release.id -eq [int64]$view.databaseId -and [string]$release.tag_name -ceq $tag -and [string]$release.name -ceq $releaseName -and [bool]$release.draft -and -not [bool]$release.prerelease -and [string]$release.target_commitish -ceq 'main'
           if (-not $releaseExact) { throw 'Numeric release metadata does not match the exact main-targeted draft.' }
+          $unexpectedAssets = @($release.assets | Where-Object { [string]$_.name -cne $assetName -and [string]$_.name -cne $sidecarName })
+          if ($unexpectedAssets.Count -gt 0 -or @($release.assets).Count -ne 2) { throw 'The draft must contain only the canonical ZIP and checksum sidecar.' }
           $assets = @($release.assets | Where-Object { [string]$_.name -ceq $assetName })
           if ($assets.Count -ne 1) { throw 'The draft must contain exactly one asset with the canonical ZIP name.' }
           $asset = $assets[0]
@@ -139,6 +146,12 @@ jobs:
           $acceptedContentTypes = @('application/zip', 'application/x-zip-compressed', 'application/octet-stream')
           $assetExact = [int64]$asset.id -gt 0 -and [string]$asset.state -ceq 'uploaded' -and [int64]$asset.size -eq $artifactBytes -and [string]$asset.digest -ceq $expectedDigest -and $acceptedContentTypes -ccontains [string]$asset.content_type
           if (-not $assetExact) { throw 'Draft asset state, size, digest, or content type does not match the requested artifact.' }
+          $sidecars = @($release.assets | Where-Object { [string]$_.name -ceq $sidecarName })
+          if ($sidecars.Count -ne 1) { throw 'The draft must contain exactly one checksum sidecar.' }
+          $sidecarAsset = $sidecars[0]
+          $acceptedSidecarTypes = @('text/plain', 'text/plain; charset=utf-8', 'application/octet-stream')
+          $sidecarExact = [int64]$sidecarAsset.id -gt 0 -and [string]$sidecarAsset.state -ceq 'uploaded' -and [int64]$sidecarAsset.size -eq $expectedSidecarBytes.Length -and [string]$sidecarAsset.digest -ceq "sha256:$expectedSidecarSha" -and $acceptedSidecarTypes -ccontains [string]$sidecarAsset.content_type
+          if (-not $sidecarExact) { throw 'Draft checksum sidecar state, size, digest, or content type is invalid.' }
 
           $archive = Join-Path $env:RUNNER_TEMP $assetName
           if (Test-Path -LiteralPath $archive) { throw 'Candidate archive path unexpectedly exists.' }
@@ -157,15 +170,25 @@ jobs:
           $downloadSha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ([int64]$download.Length -ne $artifactBytes) { throw 'Downloaded ZIP byte length changed.' }
           if ($downloadSha -cne $artifactSha) { throw 'Downloaded ZIP SHA-256 changed.' }
+          $sidecarPath = Join-Path $env:RUNNER_TEMP $sidecarName
+          if (Test-Path -LiteralPath $sidecarPath) { throw 'Checksum sidecar path unexpectedly exists.' }
+          & gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $sidecarName --output $sidecarPath
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sidecarPath -PathType Leaf)) { throw 'Draft checksum sidecar download failed.' }
+          $downloadedSidecarBytes = [IO.File]::ReadAllBytes($sidecarPath)
+          if ([Convert]::ToBase64String($downloadedSidecarBytes) -cne [Convert]::ToBase64String($expectedSidecarBytes)) { throw 'Downloaded checksum sidecar content differs from the approved ZIP identity.' }
 
           $postJson = Invoke-GhJson -Arguments $apiArguments -Label 'Re-read draft metadata after download'
           $post = $postJson | ConvertFrom-Json -Depth 20
           $postAssets = @($post.assets | Where-Object { [string]$_.name -ceq $assetName })
           if ($postAssets.Count -ne 1) { throw 'Draft asset identity changed during download.' }
           $postAsset = $postAssets[0]
+          $postSidecars = @($post.assets | Where-Object { [string]$_.name -ceq $sidecarName })
+          if ($postSidecars.Count -ne 1) { throw 'Draft checksum sidecar identity changed during download.' }
+          $postSidecar = $postSidecars[0]
           $postReleaseExact = [bool]$post.draft -and -not [bool]$post.prerelease -and [int64]$post.id -eq [int64]$release.id -and [string]$post.tag_name -ceq $tag -and [string]$post.name -ceq $releaseName -and [string]$post.target_commitish -ceq 'main'
           $postAssetExact = [int64]$postAsset.id -eq [int64]$asset.id -and [string]$postAsset.name -ceq $assetName -and [string]$postAsset.created_at -ceq [string]$asset.created_at -and [string]$postAsset.updated_at -ceq [string]$asset.updated_at -and [int64]$postAsset.size -eq $artifactBytes -and [string]$postAsset.digest -ceq $expectedDigest -and [string]$postAsset.state -ceq 'uploaded' -and [string]$postAsset.content_type -ceq [string]$asset.content_type
-          $postExact = $postReleaseExact -and $postAssetExact
+          $postSidecarExact = [int64]$postSidecar.id -eq [int64]$sidecarAsset.id -and [string]$postSidecar.name -ceq $sidecarName -and [string]$postSidecar.created_at -ceq [string]$sidecarAsset.created_at -and [string]$postSidecar.updated_at -ceq [string]$sidecarAsset.updated_at -and [int64]$postSidecar.size -eq $expectedSidecarBytes.Length -and [string]$postSidecar.digest -ceq "sha256:$expectedSidecarSha" -and [string]$postSidecar.state -ceq 'uploaded' -and [string]$postSidecar.content_type -ceq [string]$sidecarAsset.content_type
+          $postExact = $postReleaseExact -and $postAssetExact -and $postSidecarExact
           if (-not $postExact) { throw 'Draft or asset metadata changed during the acceptance download.' }
 
           $ghVersion = (gh --version | Select-Object -First 1)
@@ -181,6 +204,10 @@ jobs:
             assetDigest = [string]$asset.digest
             assetCreatedAt = [string]$asset.created_at
             assetUpdatedAt = [string]$asset.updated_at
+            sidecarName = $sidecarName
+            sidecarId = [int64]$sidecarAsset.id
+            sidecarBytes = [int64]$expectedSidecarBytes.Length
+            sidecarSha256 = $expectedSidecarSha
             releaseId = [int64]$release.id
             releaseTag = [string]$release.tag_name
             releaseName = [string]$release.name
@@ -192,7 +219,7 @@ jobs:
             ghVersion = [string]$ghVersion
           }
           $metadataText = ($metadata | ConvertTo-Json -Depth 10) + [char]10
-          $metadataPath = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence\records\download-metadata.json'
+          $metadataPath = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence\githubWindowsRunner.records\download-metadata.json'
           [IO.File]::WriteAllText($metadataPath, $metadataText, [Text.UTF8Encoding]::new($false))
 
       - name: Run package acceptance without repository token
@@ -217,16 +244,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $evidence = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence'
-          $records = Join-Path $evidence 'records'
+          $records = Join-Path $evidence 'githubWindowsRunner.records'
+          $diagnostics = Join-Path $evidence 'workflow-diagnostics'
           New-Item -ItemType Directory -Path $records -Force | Out-Null
+          New-Item -ItemType Directory -Path $diagnostics -Force | Out-Null
           $outcomes = [ordered]@{
             download = $env:DOWNLOAD_OUTCOME
             packageAcceptance = $env:ACCEPTANCE_OUTCOME
             recordedAt = [DateTimeOffset]::UtcNow.ToString('o')
           }
           $outcomeText = ($outcomes | ConvertTo-Json -Depth 5) + [char]10
-          [IO.File]::WriteAllText((Join-Path $records 'workflow-outcomes.json'), $outcomeText, [Text.UTF8Encoding]::new($false))
-          $reportPath = Join-Path $evidence 'clean-windows-report.json'
+          [IO.File]::WriteAllText((Join-Path $diagnostics 'workflow-outcomes.json'), $outcomeText, [Text.UTF8Encoding]::new($false))
+          $reportPath = Join-Path $evidence 'github-windows-runner.json'
           if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
             $artifactBytes = 0L
             [void][int64]::TryParse($env:REQUESTED_ARTIFACT_BYTES, [ref]$artifactBytes)
@@ -279,7 +308,15 @@ jobs:
                 type = 'PriorStepFailure'
                 message = 'The draft download or package acceptance step failed before a complete report was written. Inspect the job log and workflow-outcomes.json.'
               }
-              records = @('workflow-outcomes.json')
+              records = @(
+                Get-ChildItem -LiteralPath $records -File -Force | Sort-Object Name | ForEach-Object {
+                  [ordered]@{
+                    name = $_.Name
+                    bytes = [int64]$_.Length
+                    sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                  }
+                }
+              )
               limitations = @(
                 'No acceptance result is claimed. The release gate remains closed.'
                 'windows-latest and its preinstalled GitHub CLI are mutable runner dependencies; successful runs record their resolved versions.'
@@ -304,9 +341,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $reportPath = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence\clean-windows-report.json'
+          $reportPath = Join-Path $env:RUNNER_TEMP 'clean-windows-evidence\github-windows-runner.json'
           if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
-            throw 'Artifact-bound clean-windows-report.json was not produced; release gate is closed.'
+            throw 'Artifact-bound github-windows-runner.json was not produced; release gate is closed.'
           }
           $report = Get-Content -LiteralPath $reportPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 30
           $artifactSha = $env:REQUESTED_ARTIFACT_SHA256.ToLowerInvariant()
